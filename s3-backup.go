@@ -21,6 +21,7 @@ func main() {
 	a.Usage = "S3 Backup"
 	a.Commands = []*cli.Command{
 		cmd.BackupCmd(),
+		cmd.RestoreCmd(),
 	}
 
 	if err := a.Run(os.Args); err != nil {

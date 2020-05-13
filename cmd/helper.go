@@ -12,6 +12,22 @@ import (
 )
 
 var (
+	flagListenAddress    = "l"
+	envListenAddress     = "LISTEN_ADDRESS"
+	defaultListenAddress = ":2112"
+	flagFilename         = "f"
+	envFilename          = "FILENAME"
+	flagBackupPath       = "p"
+	envBackupPath        = "BACKUPPATH"
+	flagConcurrency      = "c"
+	envConcurrency       = "CONCURRENCY"
+	defaultConcurrency   = 10
+	flagRepeat           = "r"
+	envRepeat            = "REPEAT"
+	defaultRepeat        = 60
+)
+
+var (
 	s3Success = prometheus.NewDesc(
 		"probe_success",
 		"Displays whether or not the probe was a success",
@@ -35,6 +51,7 @@ type users struct {
 }
 
 type bucket struct {
+	Name         string
 	BucketPolicy string             `json:"bucketpolicy"`
 	Objects      []minio.ObjectInfo `json:"object"`
 }
@@ -79,7 +96,10 @@ func readBucketJSON(filename string, bucket *bucket) map[string]minio.ObjectInfo
 		for _, o := range bucket.Objects {
 			objects[o.Key] = o
 		}
+	} else {
+		klog.Infof("file %s does not exist", filename)
 	}
+
 	return objects
 }
 

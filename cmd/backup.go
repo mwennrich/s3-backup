@@ -18,20 +18,12 @@ import (
 	"github.com/minio/minio-go/v6"
 )
 
-var (
-	flagListenAddress    = "listen"
-	envListenAddress     = "LISTEN_ADDRESS"
-	defaultListenAddress = ":2112"
-	flagFilename         = "filename"
-	envFilename          = "FILENAME"
-	flagBackupPath       = "backuppath"
-	envBackupPath        = "BACKUPPATH"
-)
-
 // Backupper is our exporter type
 type Backupper struct {
-	filename   string
-	backuppath string
+	filename    string
+	backuppath  string
+	concurrency int
+	repeat      int
 }
 
 // Describe all the metrics we export
@@ -86,7 +78,7 @@ func (sb Backupper) backupUser(users <-chan user) {
 				// new bucket
 				os.Mkdir(userpath, 0700)
 			}
-
+			newBucket.Name = b.Name
 			newBucket.BucketPolicy, err = mc.GetBucketPolicy(b.Name)
 			if err != nil {
 				klog.Error(err)
@@ -129,30 +121,25 @@ func (sb Backupper) backupUser(users <-chan user) {
 	}
 }
 
-func (sb Backupper) startBackup() error {
-
+func (sb Backupper) backup() error {
 	userList, err := readUserFile(sb.filename)
 	if err != nil {
 		return err
 	}
 
 	var wg sync.WaitGroup
-	const numBackupClients = 1
-
 	done := make(chan struct{})
 	defer close(done)
 
 	users := make(chan user)
-
 	go func() {
 		for _, u := range userList.User {
 			//klog.Infof("process user %s", u.Accesskey)
 			users <- u
 		}
 	}()
-
-	wg.Add(numBackupClients)
-	for i := 0; i < numBackupClients; i++ {
+	wg.Add(sb.concurrency)
+	for i := 0; i < sb.concurrency; i++ {
 		go func() {
 			sb.backupUser(users)
 			wg.Done()
@@ -170,6 +157,9 @@ func startBackup(c *cli.Context) error {
 	listenAddress := c.String(flagListenAddress)
 	filename := c.String(flagFilename)
 	backuppath := c.String(flagBackupPath)
+	concurrency := c.Int(flagConcurrency)
+	repeat := c.Int(flagRepeat)
+
 	if filename == "" {
 		return fmt.Errorf("invalid empty flag %v", flagFilename)
 	}
@@ -184,17 +174,20 @@ func startBackup(c *cli.Context) error {
 	}
 
 	b := Backupper{
-		filename:   filename,
-		backuppath: backuppath,
+		filename:    filename,
+		backuppath:  backuppath,
+		concurrency: concurrency,
+		repeat:      repeat,
 	}
 
 	log.Infoln("Starting s3 backup", version.Info())
 	log.Infoln("Build context", version.BuildContext())
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(time.Duration(b.repeat) * time.Minute)
 	go func() {
-		for range ticker.C {
-			err := b.startBackup()
+		for ; true; <-ticker.C {
+			klog.Info("Starting backup")
+			err := b.backup()
 			if err != nil {
 				klog.Errorf("Backup failed: %s", err)
 			}
@@ -238,6 +231,18 @@ func BackupCmd() *cli.Command {
 				Name:    flagBackupPath,
 				Usage:   "Required. Specify backuppath.",
 				EnvVars: []string{envBackupPath},
+			},
+			&cli.IntFlag{
+				Name:    flagConcurrency,
+				Usage:   "Optional. Specify number of concurrent backup runners. (default: " + string(defaultConcurrency) + ")",
+				EnvVars: []string{envConcurrency},
+				Value:   defaultConcurrency,
+			},
+			&cli.IntFlag{
+				Name:    flagRepeat,
+				Usage:   "Optional. Specify time between backups in minutes. (default: " + string(defaultRepeat) + ")",
+				EnvVars: []string{envRepeat},
+				Value:   defaultRepeat,
 			},
 		},
 		Action: func(c *cli.Context) error {
