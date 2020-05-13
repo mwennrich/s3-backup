@@ -1,4 +1,4 @@
-module s3-prober.go
+module github.com/mwennrich/s3-backup
 
 go 1.14
 
