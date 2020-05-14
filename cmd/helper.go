@@ -97,8 +97,6 @@ func readBucketJSON(filename string, bucket *bucket) map[string]minio.ObjectInfo
 		for _, o := range bucket.Objects {
 			objects[o.Key] = o
 		}
-	} else {
-		klog.Infof("file %s does not exist", filename)
 	}
 
 	return objects

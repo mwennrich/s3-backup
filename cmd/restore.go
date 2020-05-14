@@ -48,7 +48,7 @@ func (sr Restorer) restoreBucket(buckets <-chan string) {
 			for _, o := range bucket.Objects {
 				//encode object.Key as base64
 				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
-				objectPath := bp + "/" + oe
+				objectPath := bp + "/objects/" + oe
 				//klog.Infof("pocess object: %s (%s)", o.Key, objectPath)
 
 				options := minio.PutObjectOptions{
@@ -62,7 +62,7 @@ func (sr Restorer) restoreBucket(buckets <-chan string) {
 					klog.Errorf("Unalble to upload object %s to bucket %s. %s. Aborting", o.Key, bucket.Name, err)
 					return
 				}
-				klog.Infof("successfully restored %s to %s", o.Key, bucket.Name)
+				klog.Infof("successfully restored %s to %s/%s", o.Key, bucket.User.Accesskey, bucket.Name)
 			}
 		default:
 			return

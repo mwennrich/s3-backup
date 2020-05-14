@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/base64"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"sync"
@@ -59,13 +60,18 @@ func (sb Backupper) backupBucket(buckets <-chan bucket) {
 		case b := <-buckets:
 
 			var newBucket bucket
+			var objects map[string]minio.ObjectInfo
 
 			//klog.Infof("process bucket %s", b.Name)
 			bucketpath := sb.backuppath + "/" + b.User.Accesskey + "/" + b.Name
 			if !fileExists(bucketpath) {
 				// new bucket
 				os.Mkdir(bucketpath, 0700)
+				os.Mkdir(bucketpath+"/objects", 0700)
+			} else {
+				objects = readBucketJSON(bucketpath+"/bucket.json", &b)
 			}
+
 			newBucket.Name = b.Name
 			newBucket.User = b.User
 			mc, err := minio.New(b.User.Endpoint, b.User.Accesskey, b.User.Secretkey, true)
@@ -73,20 +79,19 @@ func (sb Backupper) backupBucket(buckets <-chan bucket) {
 			if err != nil {
 				klog.Error(err)
 			}
-			objects := readBucketJSON(bucketpath+"/bucket.json", &b)
 
 			// loop over all remote objects, refresh object meta data
 			doneCh := make(chan struct{})
 			for o := range mc.ListObjects(b.Name, "", true, doneCh) {
 				//encode object.Key as base64
 				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
-				objectPath := bucketpath + "/" + oe
+				objectPath := bucketpath + "/objects/" + oe
 				//klog.Infof("pocess object: %s (%s)", o.Key, objectPath)
 
 				// check if object is missing locally or has changed. In either case, download object
 				lo, ok := objects[o.Key]
 				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
-					klog.Infof("object changed: %s", o.Key)
+					klog.Infof("object changed: %s/%s", b.User.Accesskey, o.Key)
 					mc.FGetObject(b.Name, o.Key, objectPath, minio.GetObjectOptions{})
 				}
 				newBucket.Objects = append(newBucket.Objects, o)
@@ -101,8 +106,8 @@ func (sb Backupper) backupBucket(buckets <-chan bucket) {
 			for _, o := range objects {
 				if _, ok := newObjects[o.Key]; !ok {
 					// object has been deleted, so delete local copy
-					os.Remove(bucketpath + "/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
-					klog.Infof("deleting local object: %s (%s)", o.Key, bucketpath+"/"+base64.StdEncoding.EncodeToString([]byte(o.Key)))
+					os.Remove(bucketpath + "/objects/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
+					klog.Infof("deleting local object: %s (%s)", o.Key, bucketpath+"/objects/"+base64.StdEncoding.EncodeToString([]byte(o.Key)))
 				}
 			}
 			writeBucketJSON(bucketpath+"/bucket.json", newBucket)
@@ -114,6 +119,7 @@ func (sb Backupper) backupBucket(buckets <-chan bucket) {
 }
 
 func (sb Backupper) backupUser(u user, buckets chan bucket) {
+	klog.Infof("Processing user %s", u.Accesskey)
 	mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
 	if err != nil {
 		klog.Errorf(err.Error())
@@ -126,13 +132,26 @@ func (sb Backupper) backupUser(u user, buckets chan bucket) {
 	if err != nil {
 		klog.Errorf(err.Error())
 	}
-
+	rb := make(map[string]bool)
 	// loop over all remote buckts
-
 	for _, b := range bl {
 		buckets <- bucket{
 			Name: b.Name,
 			User: u,
+		}
+		rb[b.Name] = true
+	}
+	// loop over all backupped buckets
+	localbuckets, err := ioutil.ReadDir(userpath)
+	if err != nil {
+		klog.Error(err)
+		return
+	}
+	for _, bp := range localbuckets {
+		if !rb[bp.Name()] {
+			// bucket has been deleted. so remove local copy
+			klog.Infof("bucket %s has been deleted. Removing backup %s", bp.Name(), userpath+"/"+bp.Name())
+			os.RemoveAll(userpath + "/" + bp.Name())
 		}
 	}
 }
@@ -143,25 +162,28 @@ func (sb Backupper) backup() error {
 		return err
 	}
 
-	var wg sync.WaitGroup
+	var wgu, wgb sync.WaitGroup
 	done := make(chan struct{})
 	defer close(done)
 
 	buckets := make(chan bucket, sb.concurrency)
+	wgu.Add(len(userList.User))
 	for _, u := range userList.User {
 		go func(u user) {
 			sb.backupUser(u, buckets)
-
+			wgu.Done()
 		}(u)
 	}
-	wg.Add(sb.concurrency)
+	time.Sleep(5 * time.Second)
+	wgb.Add(sb.concurrency)
 	for i := 0; i < sb.concurrency; i++ {
 		go func() {
 			sb.backupBucket(buckets)
-			wg.Done()
+			wgb.Done()
 		}()
 	}
-	wg.Wait()
+	wgu.Wait()
+	wgb.Wait()
 	close(buckets)
 	return nil
 }
