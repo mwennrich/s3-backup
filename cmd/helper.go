@@ -52,6 +52,7 @@ type users struct {
 
 type bucket struct {
 	Name         string
+	User         user
 	BucketPolicy string             `json:"bucketpolicy"`
 	Objects      []minio.ObjectInfo `json:"object"`
 }

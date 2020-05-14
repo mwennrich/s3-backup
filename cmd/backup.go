@@ -53,37 +53,27 @@ func probeHandler(w http.ResponseWriter, r *http.Request, sb Backupper) {
 }
 */
 
-func (sb Backupper) backupUser(users <-chan user) {
-	for u := range users {
-		mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
-		if err != nil {
-			klog.Errorf(err.Error())
-		}
-		userpath := sb.backuppath + "/" + u.Accesskey
-		if _, err := os.Stat(userpath); err != nil {
-			os.Mkdir(userpath, 0700)
-		}
-		bl, err := mc.ListBuckets()
-		if err != nil {
-			klog.Errorf(err.Error())
-		}
+func (sb Backupper) backupBucket(buckets <-chan bucket) {
+	for {
+		select {
+		case b := <-buckets:
 
-		// loop over all remote buckts
-		for _, b := range bl {
-			var bucket, newBucket bucket
+			var newBucket bucket
 
 			//klog.Infof("process bucket %s", b.Name)
-			bucketpath := userpath + "/" + b.Name
+			bucketpath := sb.backuppath + "/" + b.User.Accesskey + "/" + b.Name
 			if !fileExists(bucketpath) {
 				// new bucket
-				os.Mkdir(userpath, 0700)
+				os.Mkdir(bucketpath, 0700)
 			}
 			newBucket.Name = b.Name
+			newBucket.User = b.User
+			mc, err := minio.New(b.User.Endpoint, b.User.Accesskey, b.User.Secretkey, true)
 			newBucket.BucketPolicy, err = mc.GetBucketPolicy(b.Name)
 			if err != nil {
 				klog.Error(err)
 			}
-			objects := readBucketJSON(bucketpath+"/bucket.json", &bucket)
+			objects := readBucketJSON(bucketpath+"/bucket.json", &b)
 
 			// loop over all remote objects, refresh object meta data
 			doneCh := make(chan struct{})
@@ -97,7 +87,6 @@ func (sb Backupper) backupUser(users <-chan user) {
 				lo, ok := objects[o.Key]
 				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
 					klog.Infof("object changed: %s", o.Key)
-					klog.Info(o.LastModified, lo.LastModified, o.Size, lo.Size)
 					mc.FGetObject(b.Name, o.Key, objectPath, minio.GetObjectOptions{})
 				}
 				newBucket.Objects = append(newBucket.Objects, o)
@@ -117,6 +106,33 @@ func (sb Backupper) backupUser(users <-chan user) {
 				}
 			}
 			writeBucketJSON(bucketpath+"/bucket.json", newBucket)
+
+		default:
+			return
+		}
+	}
+}
+
+func (sb Backupper) backupUser(u user, buckets chan bucket) {
+	mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
+	if err != nil {
+		klog.Errorf(err.Error())
+	}
+	userpath := sb.backuppath + "/" + u.Accesskey
+	if _, err := os.Stat(userpath); err != nil {
+		os.Mkdir(userpath, 0700)
+	}
+	bl, err := mc.ListBuckets()
+	if err != nil {
+		klog.Errorf(err.Error())
+	}
+
+	// loop over all remote buckts
+
+	for _, b := range bl {
+		buckets <- bucket{
+			Name: b.Name,
+			User: u,
 		}
 	}
 }
@@ -131,24 +147,22 @@ func (sb Backupper) backup() error {
 	done := make(chan struct{})
 	defer close(done)
 
-	users := make(chan user)
-	go func() {
-		for _, u := range userList.User {
-			//klog.Infof("process user %s", u.Accesskey)
-			users <- u
-		}
-	}()
+	buckets := make(chan bucket, sb.concurrency)
+	for _, u := range userList.User {
+		go func(u user) {
+			sb.backupUser(u, buckets)
+
+		}(u)
+	}
 	wg.Add(sb.concurrency)
 	for i := 0; i < sb.concurrency; i++ {
 		go func() {
-			sb.backupUser(users)
+			sb.backupBucket(buckets)
 			wg.Done()
 		}()
 	}
-	go func() {
-		wg.Wait()
-		close(users)
-	}()
+	wg.Wait()
+	close(buckets)
 	return nil
 }
 

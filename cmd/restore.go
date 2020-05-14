@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/urfave/cli/v2"
 	"k8s.io/klog"
@@ -20,43 +21,17 @@ type Restorer struct {
 	concurrency int
 }
 
-func (sr Restorer) restoreUser(users <-chan user, done <-chan bool) {
-	select {
-	case u := <-users:
-		mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
-		if err != nil {
-			klog.Errorf(err.Error())
-		}
-		userpath := sr.backuppath + "/" + u.Accesskey
-		if _, err := os.Stat(userpath); err != nil {
-			klog.Errorf("backup %s not found: %s", userpath, err)
-			return
-		}
-		bl, err := mc.ListBuckets()
-		if err != nil {
-			klog.Errorf(err.Error())
-			return
-		}
-		if len(bl) != 0 {
-			klog.Errorf("existing buckets for % found. Aborting restore.", u.Accesskey)
-			return
-		}
-
-		// loop over all backupped buckets
-		buckets, err := ioutil.ReadDir(userpath)
-		if err != nil {
-			klog.Error(err)
-			return
-		}
-
-		for _, bp := range buckets {
+func (sr Restorer) restoreBucket(buckets <-chan string) {
+	for {
+		select {
+		case bp := <-buckets:
 			var bucket bucket
-
-			if !bp.IsDir() {
-				klog.Errorf("% is not a directory. Aborting")
-				return
+			_ = readBucketJSON(bp+"/bucket.json", &bucket)
+			klog.Infof("got path %s", bp)
+			mc, err := minio.New(bucket.User.Endpoint, bucket.User.Accesskey, bucket.User.Secretkey, true)
+			if err != nil {
+				klog.Errorf(err.Error())
 			}
-			_ = readBucketJSON(userpath+"/"+bp.Name()+"/bucket.json", &bucket)
 			if exists, err := mc.BucketExists(bucket.Name); err != nil || exists {
 				klog.Errorf("bucket %s already exists. Aborting.%s", bucket.Name, err)
 				return
@@ -73,7 +48,7 @@ func (sr Restorer) restoreUser(users <-chan user, done <-chan bool) {
 			for _, o := range bucket.Objects {
 				//encode object.Key as base64
 				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
-				objectPath := userpath + "/" + bp.Name() + "/" + oe
+				objectPath := bp + "/" + oe
 				//klog.Infof("pocess object: %s (%s)", o.Key, objectPath)
 
 				options := minio.PutObjectOptions{
@@ -89,10 +64,43 @@ func (sr Restorer) restoreUser(users <-chan user, done <-chan bool) {
 				}
 				klog.Infof("successfully restored %s to %s", o.Key, bucket.Name)
 			}
+		default:
+			return
 		}
-		klog.Infof("%s successfully restored", u.Accesskey)
-	case <-done:
+	}
+}
+func (sr Restorer) restoreUser(u user, buckets chan string) {
+	mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
+	if err != nil {
+		klog.Errorf(err.Error())
+	}
+	userpath := sr.backuppath + "/" + u.Accesskey
+	if _, err := os.Stat(userpath); err != nil {
+		klog.Errorf("backup %s not found: %s", userpath, err)
 		return
+	}
+	bl, err := mc.ListBuckets()
+	if err != nil {
+		klog.Errorf(err.Error())
+		return
+	}
+	if len(bl) != 0 {
+		klog.Errorf("existing buckets for % found. Aborting restore.", u.Accesskey)
+		return
+	}
+
+	// loop over all backupped buckets
+	localbuckets, err := ioutil.ReadDir(userpath)
+	if err != nil {
+		klog.Error(err)
+		return
+	}
+	for _, bp := range localbuckets {
+		if !bp.IsDir() {
+			klog.Errorf("% is not a directory. Aborting")
+			return
+		}
+		buckets <- userpath + "/" + bp.Name()
 	}
 }
 
@@ -102,33 +110,24 @@ func (sr Restorer) restore() error {
 		return err
 	}
 	var wg sync.WaitGroup
-	const numBackupClients = 10
 
-	done := make(chan bool)
-	defer close(done)
+	buckets := make(chan string, sr.concurrency)
 
-	users := make(chan user)
-
-	go func() {
-		for _, u := range userList.User {
-			//klog.Infof("process user %s", u.Accesskey)
-			users <- u
-		}
-		for i := 0; i < numBackupClients; i++ {
-			done <- true
-		}
-	}()
-
-	wg.Add(numBackupClients)
-	for i := 0; i < numBackupClients; i++ {
-		klog.Info("start retorer")
-		go func() {
-			sr.restoreUser(users, done)
+	for _, u := range userList.User {
+		go func(u user) {
+			sr.restoreUser(u, buckets)
+		}(u)
+	}
+	time.Sleep(5 * time.Second)
+	wg.Add(sr.concurrency)
+	for i := 0; i < sr.concurrency; i++ {
+		go func(i int) {
+			sr.restoreBucket(buckets)
 			wg.Done()
-		}()
+		}(i)
 	}
 	wg.Wait()
-	close(users)
+	close(buckets)
 	return nil
 }
 
@@ -156,6 +155,7 @@ func startRestore(c *cli.Context) error {
 		concurrency: concurrency,
 	}
 	r.restore()
+	klog.Info("done")
 	return nil
 }
 
