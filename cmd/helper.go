@@ -8,7 +8,6 @@ import (
 	"k8s.io/klog"
 
 	"github.com/minio/minio-go/v6"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
@@ -22,22 +21,13 @@ var (
 	flagConcurrency      = "c"
 	envConcurrency       = "CONCURRENCY"
 	defaultConcurrency   = 10
-	flagRepeat           = "r"
-	envRepeat            = "REPEAT"
-	defaultRepeat        = 60
-)
-
-var (
-	s3Success = prometheus.NewDesc(
-		"probe_success",
-		"Displays whether or not the probe was a success",
-		[]string{"operation", "s3_endpoint"}, nil,
-	)
-	s3Duration = prometheus.NewDesc(
-		"probe_duration_seconds",
-		"Returns how long the probe took to complete in seconds",
-		[]string{"operation", "s3_endpoint"}, nil,
-	)
+	flagInterval         = "i"
+	envInterval          = "INTERVAL"
+	defaultInterval      = 60
+	flagKey              = "key"
+	envKey               = "KEY"
+	flagCert             = "cert"
+	envCert              = "CERT"
 )
 
 type user struct {
@@ -97,6 +87,8 @@ func readBucketJSON(filename string, bucket *bucket) map[string]minio.ObjectInfo
 		for _, o := range bucket.Objects {
 			objects[o.Key] = o
 		}
+	} else {
+		klog.Infof("file %s does not exist", filename)
 	}
 
 	return objects

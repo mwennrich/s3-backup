@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
@@ -19,42 +21,48 @@ import (
 	"github.com/minio/minio-go/v6"
 )
 
+var (
+	totalObjects = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "total_objects",
+		Help: "total number of objects in backup",
+	},
+		[]string{"user", "bucket"},
+	)
+	changedObjects = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "changed_objects",
+		Help: "total number of changed and downloaded objects in backup",
+	},
+		[]string{"user", "bucket"},
+	)
+	totalBuckets = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "total_buckets",
+		Help: "total number of objects in backup",
+	},
+		[]string{"user"},
+	)
+	totalErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "total_errors",
+		Help: "total number of errors during backup",
+	},
+		[]string{"user", "bucket"},
+	)
+)
+
 // Backupper is our exporter type
 type Backupper struct {
 	filename    string
 	backuppath  string
 	concurrency int
-	repeat      int
+	interval    int
 }
 
-// Describe all the metrics we export
-func (sb Backupper) Describe(ch chan<- *prometheus.Desc) {
-	ch <- s3Success
-	ch <- s3Duration
-}
-
-/*
-// Collect metrics
-func (e Backupper) Collect(ch chan<- prometheus.Metric) {
-	minioClient, err := minio.New(e.filename, true)
+func (sb *Backupper) logErr(user string, bucket string, err error) {
 	if err != nil {
-		klog.Fatalf("Could not create minioClient to endpoint %s, %v\n", e.endpoint, err)
-		return
+		klog.Error(err)
+		totalErrors.With(prometheus.Labels{"bucket": bucket, "user": user}).Inc()
 	}
-
 }
-
-func probeHandler(w http.ResponseWriter, r *http.Request, sb Backupper) {
-	registry := prometheus.NewRegistry()
-	registry.Register(b)
-
-	// Serve
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
-}
-*/
-
-func (sb Backupper) backupBucket(buckets <-chan bucket) {
+func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 	for {
 		select {
 		case b := <-buckets:
@@ -76,12 +84,11 @@ func (sb Backupper) backupBucket(buckets <-chan bucket) {
 			newBucket.User = b.User
 			mc, err := minio.New(b.User.Endpoint, b.User.Accesskey, b.User.Secretkey, true)
 			newBucket.BucketPolicy, err = mc.GetBucketPolicy(b.Name)
-			if err != nil {
-				klog.Error(err)
-			}
+			sb.logErr(b.User.Accesskey, b.Name, err)
 
 			// loop over all remote objects, refresh object meta data
 			doneCh := make(chan struct{})
+			changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Set(0)
 			for o := range mc.ListObjects(b.Name, "", true, doneCh) {
 				//encode object.Key as base64
 				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
@@ -93,14 +100,17 @@ func (sb Backupper) backupBucket(buckets <-chan bucket) {
 				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
 					klog.Infof("object changed: %s/%s", b.User.Accesskey, o.Key)
 					mc.FGetObject(b.Name, o.Key, objectPath, minio.GetObjectOptions{})
+					changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Inc()
 				}
 				newBucket.Objects = append(newBucket.Objects, o)
 			}
 			close(doneCh)
 			// make map of new objects
 			newObjects := make(map[string]minio.ObjectInfo)
+			totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Set(0)
 			for _, o := range newBucket.Objects {
 				newObjects[o.Key] = o
+				totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Inc()
 			}
 			// check for delete objects
 			for _, o := range objects {
@@ -118,33 +128,31 @@ func (sb Backupper) backupBucket(buckets <-chan bucket) {
 	}
 }
 
-func (sb Backupper) backupUser(u user, buckets chan bucket) {
+func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 	klog.Infof("Processing user %s", u.Accesskey)
 	mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
-	if err != nil {
-		klog.Errorf(err.Error())
-	}
+	sb.logErr(u.Accesskey, "", err)
 	userpath := sb.backuppath + "/" + u.Accesskey
 	if _, err := os.Stat(userpath); err != nil {
 		os.Mkdir(userpath, 0700)
 	}
 	bl, err := mc.ListBuckets()
-	if err != nil {
-		klog.Errorf(err.Error())
-	}
+	sb.logErr(u.Accesskey, "", err)
 	rb := make(map[string]bool)
-	// loop over all remote buckts
+	// loop over all remote
+	totalBuckets.With(prometheus.Labels{"user": u.Accesskey}).Set(0)
 	for _, b := range bl {
 		buckets <- bucket{
 			Name: b.Name,
 			User: u,
 		}
 		rb[b.Name] = true
+		totalBuckets.With(prometheus.Labels{"user": u.Accesskey}).Inc()
 	}
 	// loop over all backupped buckets
 	localbuckets, err := ioutil.ReadDir(userpath)
 	if err != nil {
-		klog.Error(err)
+		sb.logErr(u.Accesskey, "", err)
 		return
 	}
 	for _, bp := range localbuckets {
@@ -156,10 +164,11 @@ func (sb Backupper) backupUser(u user, buckets chan bucket) {
 	}
 }
 
-func (sb Backupper) backup() error {
+func (sb *Backupper) backup() {
 	userList, err := readUserFile(sb.filename)
 	if err != nil {
-		return err
+		sb.logErr("", "", err)
+		return
 	}
 
 	var wgu, wgb sync.WaitGroup
@@ -185,7 +194,6 @@ func (sb Backupper) backup() error {
 	wgu.Wait()
 	wgb.Wait()
 	close(buckets)
-	return nil
 }
 
 func startBackup(c *cli.Context) error {
@@ -194,7 +202,9 @@ func startBackup(c *cli.Context) error {
 	filename := c.String(flagFilename)
 	backuppath := c.String(flagBackupPath)
 	concurrency := c.Int(flagConcurrency)
-	repeat := c.Int(flagRepeat)
+	interval := c.Int(flagInterval)
+	key := c.String(flagKey)
+	cert := c.String(flagCert)
 
 	if filename == "" {
 		return fmt.Errorf("invalid empty flag %v", flagFilename)
@@ -208,25 +218,36 @@ func startBackup(c *cli.Context) error {
 	if _, err := os.Stat(backuppath); err != nil {
 		return fmt.Errorf("backuppath not found: %s", backuppath)
 	}
+	if cert != "" || key != "" {
+		if _, err := os.Stat(backuppath); err != nil {
+			return fmt.Errorf("backuppath not found: %s", backuppath)
+		}
+		if _, err := os.Stat(backuppath); err != nil {
+			return fmt.Errorf("backuppath not found: %s", backuppath)
+		}
 
-	b := Backupper{
+	}
+
+	prometheus.MustRegister(totalBuckets)
+	prometheus.MustRegister(totalObjects)
+	prometheus.MustRegister(changedObjects)
+	prometheus.MustRegister(totalErrors)
+
+	sb := Backupper{
 		filename:    filename,
 		backuppath:  backuppath,
 		concurrency: concurrency,
-		repeat:      repeat,
+		interval:    interval,
 	}
 
 	log.Infoln("Starting s3 backup", version.Info())
 	log.Infoln("Build context", version.BuildContext())
 
-	ticker := time.NewTicker(time.Duration(b.repeat) * time.Minute)
+	ticker := time.NewTicker(time.Duration(sb.interval) * time.Minute)
 	go func() {
 		for ; true; <-ticker.C {
 			klog.Info("Starting backup")
-			err := b.backup()
-			if err != nil {
-				klog.Errorf("Backup failed: %s", err)
-			}
+			sb.backup()
 		}
 	}()
 
@@ -241,9 +262,28 @@ func startBackup(c *cli.Context) error {
 						 </html>`))
 	})
 
-	log.Infoln("Listening on", listenAddress)
-	log.Fatal(http.ListenAndServe(listenAddress, nil))
-
+	if key != "" && cert != "" {
+		caCert, err := ioutil.ReadFile(cert)
+		if err != nil {
+			log.Fatal(err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig := &tls.Config{
+			ClientCAs:  caCertPool,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+		}
+		tlsConfig.BuildNameToCertificate()
+		server := &http.Server{
+			Addr:      listenAddress,
+			TLSConfig: tlsConfig,
+		}
+		log.Infoln("Listening with mTSL on", listenAddress)
+		log.Fatal(server.ListenAndServeTLS(cert, key))
+	} else {
+		log.Infoln("Listening on", listenAddress)
+		log.Fatal(http.ListenAndServe(listenAddress, nil))
+	}
 	return nil
 }
 
@@ -275,10 +315,20 @@ func BackupCmd() *cli.Command {
 				Value:   defaultConcurrency,
 			},
 			&cli.IntFlag{
-				Name:    flagRepeat,
-				Usage:   "Optional. Specify time between backups in minutes. (default: " + string(defaultRepeat) + ")",
-				EnvVars: []string{envRepeat},
-				Value:   defaultRepeat,
+				Name:    flagInterval,
+				Usage:   "Optional. Specify time between backups in minutes. (default: " + string(defaultInterval) + ")",
+				EnvVars: []string{envInterval},
+				Value:   defaultInterval,
+			},
+			&cli.StringFlag{
+				Name:    flagKey,
+				Usage:   "Optional. Specify key for TLS.",
+				EnvVars: []string{envKey},
+			},
+			&cli.StringFlag{
+				Name:    flagCert,
+				Usage:   "Optional. Specify cart for TLS.",
+				EnvVars: []string{envCert},
 			},
 		},
 		Action: func(c *cli.Context) error {
