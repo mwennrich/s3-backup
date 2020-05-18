@@ -28,7 +28,7 @@ var (
 	},
 		[]string{"user", "bucket"},
 	)
-	changedObjects = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	changedObjects = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "changed_objects",
 		Help: "total number of changed and downloaded objects in backup",
 	},
@@ -88,7 +88,6 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 
 			// loop over all remote objects, refresh object meta data
 			doneCh := make(chan struct{})
-			changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Set(0)
 			for o := range mc.ListObjects(b.Name, "", true, doneCh) {
 				//encode object.Key as base64
 				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
@@ -98,7 +97,7 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 				// check if object is missing locally or has changed. In either case, download object
 				lo, ok := objects[o.Key]
 				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
-					klog.Infof("object changed: %s/%s", b.User.Accesskey, o.Key)
+					klog.Infof("object changed: %s/%s/%s", b.User.Accesskey, b.Name, o.Key)
 					mc.FGetObject(b.Name, o.Key, objectPath, minio.GetObjectOptions{})
 					changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Inc()
 				}
@@ -171,28 +170,25 @@ func (sb *Backupper) backup() {
 		return
 	}
 
-	var wgu, wgb sync.WaitGroup
+	var wg sync.WaitGroup
 	done := make(chan struct{})
 	defer close(done)
 
 	buckets := make(chan bucket, sb.concurrency)
-	wgu.Add(len(userList.User))
 	for _, u := range userList.User {
 		go func(u user) {
 			sb.backupUser(u, buckets)
-			wgu.Done()
 		}(u)
 	}
-	time.Sleep(5 * time.Second)
-	wgb.Add(sb.concurrency)
+	time.Sleep(10 * time.Second)
+	wg.Add(sb.concurrency)
 	for i := 0; i < sb.concurrency; i++ {
 		go func() {
 			sb.backupBucket(buckets)
-			wgb.Done()
+			wg.Done()
 		}()
 	}
-	wgu.Wait()
-	wgb.Wait()
+	wg.Wait()
 	close(buckets)
 }
 
