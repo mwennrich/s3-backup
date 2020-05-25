@@ -115,8 +115,8 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 			for _, o := range objects {
 				if _, ok := newObjects[o.Key]; !ok {
 					// object has been deleted, so delete local copy
-					os.Remove(bucketpath + "/objects/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
 					klog.Infof("deleting local object: %s (%s)", o.Key, bucketpath+"/objects/"+base64.StdEncoding.EncodeToString([]byte(o.Key)))
+					os.Remove(bucketpath + "/objects/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
 				}
 			}
 			writeBucketJSON(bucketpath+"/bucket.json", newBucket)
@@ -170,17 +170,20 @@ func (sb *Backupper) backup() {
 		return
 	}
 
-	var wg sync.WaitGroup
+	var wg, wgu sync.WaitGroup
+	buckets := make(chan bucket, sb.concurrency)
+
 	done := make(chan struct{})
 	defer close(done)
 
-	buckets := make(chan bucket, sb.concurrency)
-	for _, u := range userList.User {
+	for _, u := range userList.Users {
 		go func(u user) {
+			wgu.Add(1)
 			sb.backupUser(u, buckets)
+			wgu.Done()
 		}(u)
 	}
-	time.Sleep(10 * time.Second)
+	time.Sleep(30 * time.Second)
 	wg.Add(sb.concurrency)
 	for i := 0; i < sb.concurrency; i++ {
 		go func() {
@@ -188,6 +191,7 @@ func (sb *Backupper) backup() {
 			wg.Done()
 		}()
 	}
+	wgu.Wait()
 	wg.Wait()
 	close(buckets)
 }
@@ -240,10 +244,12 @@ func startBackup(c *cli.Context) error {
 	log.Infoln("Build context", version.BuildContext())
 
 	ticker := time.NewTicker(time.Duration(sb.interval) * time.Minute)
+
 	go func() {
 		for ; true; <-ticker.C {
 			klog.Info("Starting backup")
 			sb.backup()
+			klog.Info("Backup done")
 		}
 	}()
 
@@ -306,13 +312,13 @@ func BackupCmd() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    flagConcurrency,
-				Usage:   "Optional. Specify number of concurrent backup runners. (default: " + string(defaultConcurrency) + ")",
+				Usage:   "Optional. Specify number of concurrent backup runners.",
 				EnvVars: []string{envConcurrency},
 				Value:   defaultConcurrency,
 			},
 			&cli.IntFlag{
 				Name:    flagInterval,
-				Usage:   "Optional. Specify time between backups in minutes. (default: " + string(defaultInterval) + ")",
+				Usage:   "Optional. Specify time between backups in minutes.",
 				EnvVars: []string{envInterval},
 				Value:   defaultInterval,
 			},

@@ -113,7 +113,7 @@ func (sr Restorer) restore() error {
 
 	buckets := make(chan string, sr.concurrency)
 
-	for _, u := range userList.User {
+	for _, u := range userList.Users {
 		go func(u user) {
 			sr.restoreUser(u, buckets)
 		}(u)

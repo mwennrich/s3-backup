@@ -37,7 +37,7 @@ type user struct {
 }
 
 type users struct {
-	User []user `json:"user"`
+	Users []user `json:"users"`
 }
 
 type bucket struct {
