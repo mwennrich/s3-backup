@@ -70,8 +70,7 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 			var newBucket bucket
 			var objects map[string]minio.ObjectInfo
 
-			//klog.Infof("process bucket %s", b.Name)
-			bucketpath := sb.backuppath + "/" + b.User.Accesskey + "/" + b.Name
+			bucketpath := sb.backuppath + "/" + b.User.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(b.User.Name)) + "/" + b.Name
 			if !fileExists(bucketpath) {
 				// new bucket
 				os.Mkdir(bucketpath, 0700)
@@ -84,7 +83,7 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 			newBucket.User = b.User
 			mc, err := minio.New(b.User.Endpoint, b.User.Accesskey, b.User.Secretkey, true)
 			newBucket.BucketPolicy, err = mc.GetBucketPolicy(b.Name)
-			sb.logErr(b.User.Accesskey, b.Name, err)
+			sb.logErr(b.User.Name, b.Name, err)
 
 			// loop over all remote objects, refresh object meta data
 			doneCh := make(chan struct{})
@@ -92,25 +91,29 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 				//encode object.Key as base64
 				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
 				objectPath := bucketpath + "/objects/" + oe
-				//klog.Infof("pocess object: %s (%s)", o.Key, objectPath)
 
 				// check if object is missing locally or has changed. In either case, download object
 				lo, ok := objects[o.Key]
 				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
-					klog.Infof("object changed: %s/%s/%s", b.User.Accesskey, b.Name, o.Key)
+					klog.Infof("object changed: %s/%s/%s", b.User.Name, b.Name, o.Key)
 					mc.FGetObject(b.Name, o.Key, objectPath, minio.GetObjectOptions{})
-					changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Inc()
+					if err != nil {
+						sb.logErr(b.User.Name, b.Name, err)
+					}
+					changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
 				}
 				newBucket.Objects = append(newBucket.Objects, o)
 			}
 			close(doneCh)
+
 			// make map of new objects
 			newObjects := make(map[string]minio.ObjectInfo)
-			totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Set(0)
+			totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Set(0)
 			for _, o := range newBucket.Objects {
 				newObjects[o.Key] = o
-				totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Accesskey}).Inc()
+				totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
 			}
+
 			// check for delete objects
 			for _, o := range objects {
 				if _, ok := newObjects[o.Key]; !ok {
@@ -128,30 +131,38 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 }
 
 func (sb *Backupper) backupUser(u user, buckets chan bucket) {
-	klog.Infof("Processing user %s", u.Accesskey)
+	klog.Infof("Processing user %s", u.Name)
 	mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
-	sb.logErr(u.Accesskey, "", err)
-	userpath := sb.backuppath + "/" + u.Accesskey
+	sb.logErr(u.Name, "", err)
+
+	userpath := sb.backuppath + "/" + u.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(u.Name))
 	if _, err := os.Stat(userpath); err != nil {
 		os.Mkdir(userpath, 0700)
 	}
+
 	bl, err := mc.ListBuckets()
-	sb.logErr(u.Accesskey, "", err)
-	rb := make(map[string]bool)
+	sb.logErr(u.Name, "", err)
+	if err != nil {
+		klog.Errorf("cannot list buckets of user %s", u.Name)
+		return
+	}
+
 	// loop over all remote
-	totalBuckets.With(prometheus.Labels{"user": u.Accesskey}).Set(0)
+	rb := make(map[string]bool)
+	totalBuckets.With(prometheus.Labels{"user": u.Name}).Set(0)
 	for _, b := range bl {
 		buckets <- bucket{
 			Name: b.Name,
 			User: u,
 		}
 		rb[b.Name] = true
-		totalBuckets.With(prometheus.Labels{"user": u.Accesskey}).Inc()
+		totalBuckets.With(prometheus.Labels{"user": u.Name}).Inc()
 	}
+
 	// loop over all backupped buckets
 	localbuckets, err := ioutil.ReadDir(userpath)
 	if err != nil {
-		sb.logErr(u.Accesskey, "", err)
+		sb.logErr(u.Name, "", err)
 		return
 	}
 	for _, bp := range localbuckets {
@@ -175,7 +186,6 @@ func (sb *Backupper) backup() {
 
 	done := make(chan struct{})
 	defer close(done)
-
 	for _, u := range userList.Users {
 		go func(u user) {
 			wgu.Add(1)
@@ -296,7 +306,7 @@ func BackupCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    flagListenAddress,
-				Usage:   "Optional. Specify listen address.",
+				Usage:   "Optional. Specify listen address for prometheus /metrics.",
 				EnvVars: []string{envListenAddress},
 				Value:   defaultListenAddress,
 			},

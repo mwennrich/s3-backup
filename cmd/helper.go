@@ -30,10 +30,17 @@ var (
 	envCert              = "CERT"
 )
 
+type key struct {
+	Accesskey string `json:"access_key"`
+	Secretkey string `json:"secret_key"`
+}
+
 type user struct {
+	Name      string `json:"displayname"`
+	Endpoint  string `json:"endpoint"`
 	Accesskey string `json:"accesskey"`
 	Secretkey string `json:"secretkey"`
-	Endpoint  string `json:"endpoint"`
+	Keys      []key  `json:"keys"`
 }
 
 type users struct {
@@ -63,6 +70,14 @@ func readUserFile(filename string) (users, error) {
 	err = json.Unmarshal(j, &userList)
 	if err != nil {
 		return userList, err
+	}
+	for i := range userList.Users {
+		// Get working keypair from keys lists
+		if (userList.Users[i].Accesskey == "" || userList.Users[i].Secretkey == "") && len(userList.Users[i].Keys) > 0 {
+			userList.Users[i].Accesskey = userList.Users[i].Keys[0].Accesskey
+			userList.Users[i].Secretkey = userList.Users[i].Keys[0].Secretkey
+		}
+
 	}
 	return userList, nil
 }

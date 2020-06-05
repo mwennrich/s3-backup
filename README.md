@@ -34,11 +34,13 @@ the config file is a json file with following format:
 {
   "users": [
     {
+      "displayname": "user1",
       "accesskey": "acceskey1",
       "endpoint": "s3.example.com",
       "secretkey": "secretkey1"
     },
     {
+      "displayname": "user2",
       "accesskey": "accesskey2",
       "endpoint": "s3.example.com",
       "secretkey": "secretkey2"
