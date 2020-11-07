@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -18,7 +19,8 @@ import (
 	"github.com/urfave/cli/v2"
 	"k8s.io/klog"
 
-	"github.com/minio/minio-go/v6"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 var (
@@ -81,30 +83,50 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 
 			newBucket.Name = b.Name
 			newBucket.User = b.User
-			mc, err := minio.New(b.User.Endpoint, b.User.Accesskey, b.User.Secretkey, true)
-			newBucket.BucketPolicy, err = mc.GetBucketPolicy(b.Name)
+			mc, err := minio.New(b.User.Endpoint, &minio.Options{
+				Creds:  credentials.NewStaticV4(b.User.Accesskey, b.User.Secretkey, ""),
+				Secure: true,
+				Region: "us-east-1",
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 5,
+					MaxConnsPerHost:     5,
+				},
+				BucketLookup: minio.BucketLookupPath,
+			})
+			newBucket.BucketPolicy, err = mc.GetBucketPolicy(context.Background(), b.Name)
 			sb.logErr(b.User.Name, b.Name, err)
 
+			hadErrors := false
 			// loop over all remote objects, refresh object meta data
-			doneCh := make(chan struct{})
-			for o := range mc.ListObjects(b.Name, "", true, doneCh) {
+			for o := range mc.ListObjects(context.Background(), b.Name, minio.ListObjectsOptions{
+				UseV1:     false,
+				Prefix:    "",
+				Recursive: true,
+			}) {
+				if o.Err == nil {
+					hadErrors = true
+				}
+
 				//encode object.Key as base64
 				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
 				objectPath := bucketpath + "/objects/" + oe
+
+				// send objec to channel for more concurrency XXX
 
 				// check if object is missing locally or has changed. In either case, download object
 				lo, ok := objects[o.Key]
 				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
 					klog.Infof("object changed: %s/%s/%s", b.User.Name, b.Name, o.Key)
-					mc.FGetObject(b.Name, o.Key, objectPath, minio.GetObjectOptions{})
-					if err != nil {
-						sb.logErr(b.User.Name, b.Name, err)
-					}
+					go func() {
+						mc.FGetObject(context.Background(), b.Name, o.Key, objectPath, minio.GetObjectOptions{})
+						if err != nil {
+							sb.logErr(b.User.Name, b.Name, err)
+						}
+					}()
 					changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
 				}
 				newBucket.Objects = append(newBucket.Objects, o)
 			}
-			close(doneCh)
 
 			// make map of new objects
 			newObjects := make(map[string]minio.ObjectInfo)
@@ -114,12 +136,15 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 				totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
 			}
 
-			// check for delete objects
-			for _, o := range objects {
-				if _, ok := newObjects[o.Key]; !ok {
-					// object has been deleted, so delete local copy
-					klog.Infof("deleting local object: %s (%s)", o.Key, bucketpath+"/objects/"+base64.StdEncoding.EncodeToString([]byte(o.Key)))
-					os.Remove(bucketpath + "/objects/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
+			// if we had errors: don't delete anything
+			if !hadErrors {
+				// check for delete objects
+				for _, o := range objects {
+					if _, ok := newObjects[o.Key]; !ok {
+						// object has been deleted, so delete local copy
+						klog.Infof("deleting local object: %s (%s)", o.Key, bucketpath+"/objects/"+base64.StdEncoding.EncodeToString([]byte(o.Key)))
+						os.Remove(bucketpath + "/objects/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
+					}
 				}
 			}
 			writeBucketJSON(bucketpath+"/bucket.json", newBucket)
@@ -132,7 +157,14 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 
 func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 	klog.Infof("Processing user %s", u.Name)
-	mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
+	mc, err := minio.New(u.Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(u.Accesskey, u.Secretkey, ""),
+		Secure: true,
+		Region: "us-east-1",
+		//		Transport: &http.Transport{
+		//			TLSHandshakeTimeout: 5 * time.Second,
+		//		},
+	})
 	sb.logErr(u.Name, "", err)
 
 	userpath := sb.backuppath + "/" + u.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(u.Name))
@@ -140,7 +172,7 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 		os.Mkdir(userpath, 0700)
 	}
 
-	bl, err := mc.ListBuckets()
+	bl, err := mc.ListBuckets(context.Background())
 	sb.logErr(u.Name, "", err)
 	if err != nil {
 		klog.Errorf("cannot list buckets of user %s", u.Name)
@@ -193,7 +225,7 @@ func (sb *Backupper) backup() {
 			wgu.Done()
 		}(u)
 	}
-	time.Sleep(30 * time.Second)
+	time.Sleep(10 * time.Second)
 	wg.Add(sb.concurrency)
 	for i := 0; i < sb.concurrency; i++ {
 		go func() {

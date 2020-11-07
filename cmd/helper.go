@@ -7,7 +7,7 @@ import (
 
 	"k8s.io/klog"
 
-	"github.com/minio/minio-go/v6"
+	"github.com/minio/minio-go/v7"
 )
 
 var (
@@ -31,8 +31,8 @@ var (
 )
 
 type key struct {
-	Accesskey string `json:"access_key"`
-	Secretkey string `json:"secret_key"`
+	Accesskey string `json:"accesskey"`
+	Secretkey string `json:"secretkey"`
 }
 
 type user struct {

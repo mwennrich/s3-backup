@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -11,7 +13,8 @@ import (
 	"github.com/urfave/cli/v2"
 	"k8s.io/klog"
 
-	"github.com/minio/minio-go/v6"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // Restorer type
@@ -25,20 +28,29 @@ func (sr Restorer) restoreBucket(buckets <-chan bucket) {
 	for {
 		select {
 		case bucket := <-buckets:
-			mc, err := minio.New(bucket.User.Endpoint, bucket.User.Accesskey, bucket.User.Secretkey, true)
+			mc, err := minio.New(bucket.User.Endpoint, &minio.Options{
+				Creds:  credentials.NewStaticV4(bucket.User.Accesskey, bucket.User.Secretkey, ""),
+				Secure: true,
+				Region: "us-east-1",
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 5,
+					MaxConnsPerHost:     5,
+				},
+				BucketLookup: minio.BucketLookupPath,
+			})
 			if err != nil {
 				klog.Errorf(err.Error())
 			}
-			if exists, err := mc.BucketExists(bucket.Name); err != nil || exists {
+			if exists, err := mc.BucketExists(context.Background(), bucket.Name); err != nil || exists {
 				klog.Errorf("bucket %s already exists. Aborting.%s", bucket.Name, err)
 				return
 			}
-			if err := mc.MakeBucket(bucket.Name, ""); err != nil {
+			if err := mc.MakeBucket(context.Background(), bucket.Name, minio.MakeBucketOptions{}); err != nil {
 				klog.Errorf("Unable to create bucket %s. %s. Aborting", bucket.Name, err)
 				return
 			}
 
-			if err = mc.SetBucketPolicy(bucket.Name, bucket.BucketPolicy); err != nil {
+			if err = mc.SetBucketPolicy(context.Background(), bucket.Name, bucket.BucketPolicy); err != nil {
 				klog.Errorf("Unable to set BucketPolicy for bucket %s. %s. Aborting", bucket.Name, err)
 				return
 			}
@@ -53,10 +65,12 @@ func (sr Restorer) restoreBucket(buckets <-chan bucket) {
 					ContentType:  o.ContentType,
 					StorageClass: o.StorageClass,
 				}
-				if _, err := mc.FPutObject(bucket.Name, o.Key, objectPath, options); err != nil {
-					klog.Errorf("Unable to upload object %s to bucket %s. %s. Aborting", o.Key, bucket.Name, err)
-					return
-				}
+				go func() {
+					if _, err := mc.FPutObject(context.Background(), bucket.Name, o.Key, objectPath, options); err != nil {
+						klog.Errorf("Unable to upload object %s to bucket %s. %s. Aborting", o.Key, bucket.Name, err)
+						return
+					}
+				}()
 				klog.Infof("successfully restored %s to %s/%s", o.Key, bucket.User.Name, bucket.Name)
 			}
 		default:
@@ -65,7 +79,11 @@ func (sr Restorer) restoreBucket(buckets <-chan bucket) {
 	}
 }
 func (sr Restorer) restoreUser(u user, buckets chan bucket) {
-	mc, err := minio.New(u.Endpoint, u.Accesskey, u.Secretkey, true)
+	mc, err := minio.New(u.Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(u.Accesskey, u.Secretkey, ""),
+		Secure: true,
+		Region: "us-east-1",
+	})
 	if err != nil {
 		klog.Errorf("failed to connect to %s with %s", u.Endpoint, u.Accesskey)
 	}
@@ -74,7 +92,7 @@ func (sr Restorer) restoreUser(u user, buckets chan bucket) {
 		klog.Errorf("backup %s not found: %s", userpath, err)
 		return
 	}
-	bl, err := mc.ListBuckets()
+	bl, err := mc.ListBuckets(context.Background())
 
 	if err != nil {
 		klog.Errorf("failed to list buckets %s", err)
@@ -121,7 +139,7 @@ func (sr Restorer) restore() error {
 			sr.restoreUser(u, buckets)
 		}(u)
 	}
-	time.Sleep(30 * time.Second)
+	time.Sleep(10 * time.Second)
 	wg.Add(sr.concurrency)
 	for i := 0; i < sr.concurrency; i++ {
 		go func(i int) {
