@@ -5,12 +5,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/urfave/cli/v2"
+	"golang.org/x/net/http2"
 	"k8s.io/klog"
 
 	"github.com/minio/minio-go/v7"
@@ -24,61 +23,60 @@ type Restorer struct {
 	concurrency int
 }
 
-func (sr Restorer) restoreBucket(buckets <-chan bucket) {
-	for {
-		select {
-		case bucket := <-buckets:
-			mc, err := minio.New(bucket.User.Endpoint, &minio.Options{
-				Creds:  credentials.NewStaticV4(bucket.User.Accesskey, bucket.User.Secretkey, ""),
-				Secure: true,
-				Region: "us-east-1",
-				Transport: &http.Transport{
-					MaxIdleConnsPerHost: 5,
-					MaxConnsPerHost:     5,
-				},
-				BucketLookup: minio.BucketLookupPath,
-			})
-			if err != nil {
-				klog.Errorf(err.Error())
-			}
-			if exists, err := mc.BucketExists(context.Background(), bucket.Name); err != nil || exists {
-				klog.Errorf("bucket %s already exists. Aborting.%s", bucket.Name, err)
-				return
-			}
-			if err := mc.MakeBucket(context.Background(), bucket.Name, minio.MakeBucketOptions{}); err != nil {
-				klog.Errorf("Unable to create bucket %s. %s. Aborting", bucket.Name, err)
-				return
-			}
-
-			if err = mc.SetBucketPolicy(context.Background(), bucket.Name, bucket.BucketPolicy); err != nil {
-				klog.Errorf("Unable to set BucketPolicy for bucket %s. %s. Aborting", bucket.Name, err)
-				return
-			}
-			for _, o := range bucket.Objects {
-				//encode object.Key as base64
-				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
-				objectPath := sr.backuppath + "/" + bucket.User.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(bucket.User.Name)) + "/" + bucket.Name + "/objects/" + oe
-
-				options := minio.PutObjectOptions{
-					UserMetadata: o.UserMetadata,
-					UserTags:     o.UserTags,
-					ContentType:  o.ContentType,
-					StorageClass: o.StorageClass,
-				}
-				go func() {
-					if _, err := mc.FPutObject(context.Background(), bucket.Name, o.Key, objectPath, options); err != nil {
-						klog.Errorf("Unable to upload object %s to bucket %s. %s. Aborting", o.Key, bucket.Name, err)
-						return
-					}
-				}()
-				klog.Infof("successfully restored %s to %s/%s", o.Key, bucket.User.Name, bucket.Name)
-			}
-		default:
-			return
-		}
+func (sr Restorer) restoreBucket(bucket bucket) {
+	mc, err := minio.New(bucket.User.Endpoint, &minio.Options{
+		Creds:        credentials.NewStaticV4(bucket.User.Accesskey, bucket.User.Secretkey, ""),
+		Secure:       true,
+		Region:       "us-east-1",
+		Transport:    &http2.Transport{},
+		BucketLookup: minio.BucketLookupPath,
+	})
+	if err != nil {
+		klog.Errorf(err.Error())
 	}
+	if exists, err := mc.BucketExists(context.Background(), bucket.Name); err != nil || exists {
+		klog.Errorf("bucket %s already exists. Aborting.%s", bucket.Name, err)
+		return
+	}
+	if err := mc.MakeBucket(context.Background(), bucket.Name, minio.MakeBucketOptions{}); err != nil {
+		klog.Errorf("Unable to create bucket %s. %s. Aborting", bucket.Name, err)
+		return
+	}
+
+	if err = mc.SetBucketPolicy(context.Background(), bucket.Name, bucket.BucketPolicy); err != nil {
+		klog.Errorf("Unable to set BucketPolicy for bucket %s. %s. Aborting", bucket.Name, err)
+		return
+	}
+	var wg sync.WaitGroup
+	conns := make(chan int, sr.concurrency)
+
+	for _, o := range bucket.Objects {
+		//encode object.Key as base64
+		oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
+		objectPath := sr.backuppath + "/" + bucket.User.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(bucket.User.Name)) + "/" + bucket.Name + "/objects/" + oe
+
+		options := minio.PutObjectOptions{
+			UserMetadata: o.UserMetadata,
+			UserTags:     o.UserTags,
+			ContentType:  o.ContentType,
+			StorageClass: o.StorageClass,
+		}
+		conns <- 1
+		wg.Add(1)
+		go func() {
+			if _, err := mc.FPutObject(context.Background(), bucket.Name, o.Key, objectPath, options); err != nil {
+				klog.Errorf("Unable to upload object %s to bucket %s. %s. Aborting", o.Key, bucket.Name, err)
+				return
+			}
+			_ = <-conns
+			wg.Done()
+		}()
+		klog.Infof("successfully restored %s to %s/%s", o.Key, bucket.User.Name, bucket.Name)
+	}
+	wg.Wait()
 }
-func (sr Restorer) restoreUser(u user, buckets chan bucket) {
+
+func (sr Restorer) restoreUser(u user) {
 	mc, err := minio.New(u.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(u.Accesskey, u.Secretkey, ""),
 		Secure: true,
@@ -120,7 +118,7 @@ func (sr Restorer) restoreUser(u user, buckets chan bucket) {
 		_ = readBucketJSON(userpath+"/"+bp.Name()+"/bucket.json", &bucket)
 		bucket.User.Accesskey = u.Keys[0].Accesskey
 		bucket.User.Secretkey = u.Keys[0].Secretkey
-		buckets <- bucket
+		sr.restoreBucket(bucket)
 	}
 }
 
@@ -129,26 +127,12 @@ func (sr Restorer) restore() error {
 	if err != nil {
 		return err
 	}
-	var wg sync.WaitGroup
-
-	buckets := make(chan bucket, sr.concurrency)
-
 	for _, u := range userList.Users {
 		go func(u user) {
 			klog.Infof("begin restore user %s", u.Name)
-			sr.restoreUser(u, buckets)
+			sr.restoreUser(u)
 		}(u)
 	}
-	time.Sleep(10 * time.Second)
-	wg.Add(sr.concurrency)
-	for i := 0; i < sr.concurrency; i++ {
-		go func(i int) {
-			sr.restoreBucket(buckets)
-			wg.Done()
-		}(i)
-	}
-	wg.Wait()
-	close(buckets)
 	return nil
 }
 
@@ -197,7 +181,7 @@ func RestoreCmd() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    flagConcurrency,
-				Usage:   "Optional. Specify number of concurrent restore runners. (default: " + string(defaultConcurrency) + ")",
+				Usage:   "Optional. Specify number of concurrent restore runners. (default: " + string(rune(defaultConcurrency)) + ")",
 				EnvVars: []string{envConcurrency},
 				Value:   defaultConcurrency,
 			},

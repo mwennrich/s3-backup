@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/net/http2"
 	"k8s.io/klog"
 
 	"github.com/minio/minio-go/v7"
@@ -58,114 +59,126 @@ type Backupper struct {
 	interval    int
 }
 
-func (sb *Backupper) logErr(user string, bucket string, err error) {
+func (sb *Backupper) logErr(user string, bucket string, err error, op string) {
 	if err != nil {
-		klog.Error(err)
+		klog.Errorf("%s: %q", op, err)
 		totalErrors.With(prometheus.Labels{"bucket": bucket, "user": user}).Inc()
 	}
 }
-func (sb *Backupper) backupBucket(buckets <-chan bucket) {
-	for {
-		select {
-		case b := <-buckets:
+func (sb *Backupper) backupBucket(b bucket) {
+	klog.Infof("Processing bucket %s\n", b.Name)
+	var newBucket bucket
+	var objects map[string]minio.ObjectInfo
 
-			var newBucket bucket
-			var objects map[string]minio.ObjectInfo
+	bucketpath := sb.backuppath + "/" + b.User.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(b.User.Name)) + "/" + b.Name
+	if !fileExists(bucketpath) {
+		// new bucket
+		os.Mkdir(bucketpath, 0700)
+	} else {
+		objects = readBucketJSON(bucketpath+"/bucket.json", &b)
+	}
+	if !fileExists(bucketpath + "/objects") {
+		os.Mkdir(bucketpath+"/objects", 0700)
+	}
 
-			bucketpath := sb.backuppath + "/" + b.User.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(b.User.Name)) + "/" + b.Name
-			if !fileExists(bucketpath) {
-				// new bucket
-				os.Mkdir(bucketpath, 0700)
-				os.Mkdir(bucketpath+"/objects", 0700)
-			} else {
-				objects = readBucketJSON(bucketpath+"/bucket.json", &b)
-			}
+	newBucket.Name = b.Name
+	newBucket.User = b.User
+	mc, err := minio.New(b.User.Endpoint, &minio.Options{
+		Creds:        credentials.NewStaticV4(b.User.Accesskey, b.User.Secretkey, ""),
+		Secure:       true,
+		Region:       "us-east-1",
+		BucketLookup: minio.BucketLookupPath,
+		Transport:    &http2.Transport{},
+	})
+	newBucket.BucketPolicy, err = mc.GetBucketPolicy(context.Background(), b.Name)
+	sb.logErr(b.User.Name, b.Name, err, "GetBucketPoliy")
 
-			newBucket.Name = b.Name
-			newBucket.User = b.User
-			mc, err := minio.New(b.User.Endpoint, &minio.Options{
-				Creds:  credentials.NewStaticV4(b.User.Accesskey, b.User.Secretkey, ""),
-				Secure: true,
-				Region: "us-east-1",
-				Transport: &http.Transport{
-					MaxIdleConnsPerHost: 5,
-					MaxConnsPerHost:     5,
-				},
-				BucketLookup: minio.BucketLookupPath,
-			})
-			newBucket.BucketPolicy, err = mc.GetBucketPolicy(context.Background(), b.Name)
-			sb.logErr(b.User.Name, b.Name, err)
+	// cache existing obejects in map
+	fsobj := make(map[string]int)
+	files, err := ioutil.ReadDir(bucketpath + "/objects/")
+	if err != nil {
+		sb.logErr(b.User.Name, "", err, "ReadDir")
+		return
+	}
+	for _, file := range files {
+		fsobj[file.Name()] = 1
+	}
 
-			hadErrors := false
-			// loop over all remote objects, refresh object meta data
-			for o := range mc.ListObjects(context.Background(), b.Name, minio.ListObjectsOptions{
-				UseV1:     false,
-				Prefix:    "",
-				Recursive: true,
-			}) {
-				if o.Err == nil {
-					hadErrors = true
+	hadErrors := false
+	var wg sync.WaitGroup
+	conns := make(chan int, sb.concurrency)
+
+	// loop over all remote objects, refresh object meta data
+	for o := range mc.ListObjects(context.Background(), b.Name, minio.ListObjectsOptions{
+		UseV1:     false,
+		Prefix:    "",
+		Recursive: true,
+	}) {
+		if o.Err == nil {
+			hadErrors = true
+		}
+
+		//encode object.Key as base64
+		oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
+		objectPath := bucketpath + "/objects/" + oe
+
+		// check if object is missing locally or has changed. In either case, download object
+		lo, ok := objects[o.Key]
+		_, fsok := fsobj[oe]
+		if !ok || !fsok || o.LastModified != lo.LastModified || o.Size != lo.Size {
+			conns <- 1
+			wg.Add(1)
+			go func() {
+				mc.FGetObject(context.Background(), b.Name, o.Key, objectPath, minio.GetObjectOptions{})
+				if err != nil {
+					sb.logErr(b.User.Name, b.Name, err, "FGetObject")
 				}
+				klog.Infof("object changed: %s/%s/%s", b.User.Name, b.Name, o.Key)
+				changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
+				_ = <-conns
+				wg.Done()
+			}()
+		}
+		/*else {
+			klog.Infof("object unchanged: %s/%s/%s", b.User.Name, b.Name, o.Key)
+		}
+		*/
+		newBucket.Objects = append(newBucket.Objects, o)
+	}
+	wg.Wait()
 
-				//encode object.Key as base64
-				oe := base64.StdEncoding.EncodeToString([]byte(o.Key))
-				objectPath := bucketpath + "/objects/" + oe
+	// make map of new objects
+	newObjects := make(map[string]minio.ObjectInfo)
+	totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Set(0)
+	for _, o := range newBucket.Objects {
+		newObjects[o.Key] = o
+		totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
+	}
 
-				// send objec to channel for more concurrency XXX
-
-				// check if object is missing locally or has changed. In either case, download object
-				lo, ok := objects[o.Key]
-				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
-					klog.Infof("object changed: %s/%s/%s", b.User.Name, b.Name, o.Key)
-					go func() {
-						mc.FGetObject(context.Background(), b.Name, o.Key, objectPath, minio.GetObjectOptions{})
-						if err != nil {
-							sb.logErr(b.User.Name, b.Name, err)
-						}
-					}()
-					changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
-				}
-				newBucket.Objects = append(newBucket.Objects, o)
+	// if we had errors: don't delete anything
+	if !hadErrors {
+		// check for delete objects
+		for _, o := range objects {
+			if _, ok := newObjects[o.Key]; !ok {
+				// object has been deleted, so delete local copy
+				klog.Infof("deleting local object: %s (%s)", o.Key, bucketpath+"/objects/"+base64.StdEncoding.EncodeToString([]byte(o.Key)))
+				os.Remove(bucketpath + "/objects/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
 			}
-
-			// make map of new objects
-			newObjects := make(map[string]minio.ObjectInfo)
-			totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Set(0)
-			for _, o := range newBucket.Objects {
-				newObjects[o.Key] = o
-				totalObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
-			}
-
-			// if we had errors: don't delete anything
-			if !hadErrors {
-				// check for delete objects
-				for _, o := range objects {
-					if _, ok := newObjects[o.Key]; !ok {
-						// object has been deleted, so delete local copy
-						klog.Infof("deleting local object: %s (%s)", o.Key, bucketpath+"/objects/"+base64.StdEncoding.EncodeToString([]byte(o.Key)))
-						os.Remove(bucketpath + "/objects/" + base64.StdEncoding.EncodeToString([]byte(o.Key)))
-					}
-				}
-			}
-			writeBucketJSON(bucketpath+"/bucket.json", newBucket)
-
-		default:
-			return
 		}
 	}
+	writeBucketJSON(bucketpath+"/bucket.json", newBucket)
+	klog.Infof("Processing bucket %s done\n", newBucket.Name)
+
 }
 
-func (sb *Backupper) backupUser(u user, buckets chan bucket) {
+func (sb *Backupper) backupUser(u user) {
 	klog.Infof("Processing user %s", u.Name)
 	mc, err := minio.New(u.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(u.Accesskey, u.Secretkey, ""),
 		Secure: true,
 		Region: "us-east-1",
-		//		Transport: &http.Transport{
-		//			TLSHandshakeTimeout: 5 * time.Second,
-		//		},
 	})
-	sb.logErr(u.Name, "", err)
+	sb.logErr(u.Name, "", err, "New")
 
 	userpath := sb.backuppath + "/" + u.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(u.Name))
 	if _, err := os.Stat(userpath); err != nil {
@@ -173,7 +186,7 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 	}
 
 	bl, err := mc.ListBuckets(context.Background())
-	sb.logErr(u.Name, "", err)
+	sb.logErr(u.Name, "", err, "ListBuckets")
 	if err != nil {
 		klog.Errorf("cannot list buckets of user %s", u.Name)
 		return
@@ -182,11 +195,12 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 	// loop over all remote
 	rb := make(map[string]bool)
 	totalBuckets.With(prometheus.Labels{"user": u.Name}).Set(0)
+
 	for _, b := range bl {
-		buckets <- bucket{
+		sb.backupBucket(bucket{
 			Name: b.Name,
 			User: u,
-		}
+		})
 		rb[b.Name] = true
 		totalBuckets.With(prometheus.Labels{"user": u.Name}).Inc()
 	}
@@ -194,7 +208,7 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 	// loop over all backupped buckets
 	localbuckets, err := ioutil.ReadDir(userpath)
 	if err != nil {
-		sb.logErr(u.Name, "", err)
+		sb.logErr(u.Name, "", err, "ReadDir")
 		return
 	}
 	for _, bp := range localbuckets {
@@ -209,33 +223,12 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 func (sb *Backupper) backup() {
 	userList, err := readUserFile(sb.filename)
 	if err != nil {
-		sb.logErr("", "", err)
+		sb.logErr("", "", err, "ReadUserFile")
 		return
 	}
-
-	var wg, wgu sync.WaitGroup
-	buckets := make(chan bucket, sb.concurrency)
-
-	done := make(chan struct{})
-	defer close(done)
 	for _, u := range userList.Users {
-		go func(u user) {
-			wgu.Add(1)
-			sb.backupUser(u, buckets)
-			wgu.Done()
-		}(u)
+		sb.backupUser(u)
 	}
-	time.Sleep(10 * time.Second)
-	wg.Add(sb.concurrency)
-	for i := 0; i < sb.concurrency; i++ {
-		go func() {
-			sb.backupBucket(buckets)
-			wg.Done()
-		}()
-	}
-	wgu.Wait()
-	wg.Wait()
-	close(buckets)
 }
 
 func startBackup(c *cli.Context) error {
