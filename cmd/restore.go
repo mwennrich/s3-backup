@@ -139,7 +139,7 @@ func (sr Restorer) restore() error {
 			sr.restoreUser(u, buckets)
 		}(u)
 	}
-	time.Sleep(10 * time.Second)
+	time.Sleep(30 * time.Second)
 	wg.Add(sr.concurrency)
 	for i := 0; i < sr.concurrency; i++ {
 		go func(i int) {
@@ -197,7 +197,7 @@ func RestoreCmd() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    flagConcurrency,
-				Usage:   "Optional. Specify number of concurrent restore runners. (default: " + string(defaultConcurrency) + ")",
+				Usage:   "Optional. Specify number of concurrent restore runners. (default: " + string(rune(defaultConcurrency)) + ")",
 				EnvVars: []string{envConcurrency},
 				Value:   defaultConcurrency,
 			},

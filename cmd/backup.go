@@ -58,9 +58,9 @@ type Backupper struct {
 	interval    int
 }
 
-func (sb *Backupper) logErr(user string, bucket string, err error) {
+func (sb *Backupper) logErr(user string, bucket string, err error, op string) {
 	if err != nil {
-		klog.Error(err)
+		klog.Errorf("%s: %q", op, err)
 		totalErrors.With(prometheus.Labels{"bucket": bucket, "user": user}).Inc()
 	}
 }
@@ -69,6 +69,7 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 		select {
 		case b := <-buckets:
 
+			klog.Infof("Processing bucket %s\n", b.Name)
 			var newBucket bucket
 			var objects map[string]minio.ObjectInfo
 
@@ -84,19 +85,32 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 			newBucket.Name = b.Name
 			newBucket.User = b.User
 			mc, err := minio.New(b.User.Endpoint, &minio.Options{
-				Creds:  credentials.NewStaticV4(b.User.Accesskey, b.User.Secretkey, ""),
-				Secure: true,
-				Region: "us-east-1",
-				Transport: &http.Transport{
-					MaxIdleConnsPerHost: 5,
-					MaxConnsPerHost:     5,
-				},
+				Creds:        credentials.NewStaticV4(b.User.Accesskey, b.User.Secretkey, ""),
+				Secure:       true,
+				Region:       "us-east-1",
 				BucketLookup: minio.BucketLookupPath,
+				Transport: &http.Transport{
+					Proxy:                 http.ProxyFromEnvironment,
+					MaxIdleConnsPerHost:   256,
+					IdleConnTimeout:       90 * time.Second,
+					TLSHandshakeTimeout:   10 * time.Second,
+					ExpectContinueTimeout: 10 * time.Second,
+					// Set this value so that the underlying transport round-tripper
+					// doesn't try to auto decode the body of objects with
+					// content-encoding set to `gzip`.
+					//
+					// Refer:
+					//    https://golang.org/src/net/http/transport.go?h=roundTrip#L1843
+					DisableCompression: true,
+					MaxConnsPerHost:    256,
+				},
 			})
 			newBucket.BucketPolicy, err = mc.GetBucketPolicy(context.Background(), b.Name)
-			sb.logErr(b.User.Name, b.Name, err)
+			sb.logErr(b.User.Name, b.Name, err, "GetBucketPoliy")
 
 			hadErrors := false
+			var wg sync.WaitGroup
+
 			// loop over all remote objects, refresh object meta data
 			for o := range mc.ListObjects(context.Background(), b.Name, minio.ListObjectsOptions{
 				UseV1:     false,
@@ -113,20 +127,27 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 
 				// send objec to channel for more concurrency XXX
 
+				conns := make(chan int, 5)
+
 				// check if object is missing locally or has changed. In either case, download object
 				lo, ok := objects[o.Key]
 				if !ok || !fileExists(objectPath) || o.LastModified != lo.LastModified || o.Size != lo.Size {
 					klog.Infof("object changed: %s/%s/%s", b.User.Name, b.Name, o.Key)
+					conns <- 1
 					go func() {
+						wg.Add(1)
 						mc.FGetObject(context.Background(), b.Name, o.Key, objectPath, minio.GetObjectOptions{})
 						if err != nil {
-							sb.logErr(b.User.Name, b.Name, err)
+							sb.logErr(b.User.Name, b.Name, err, "FGetObject")
 						}
+						wg.Done()
+						_ = <-conns
 					}()
 					changedObjects.With(prometheus.Labels{"bucket": b.Name, "user": b.User.Name}).Inc()
 				}
 				newBucket.Objects = append(newBucket.Objects, o)
 			}
+			wg.Wait()
 
 			// make map of new objects
 			newObjects := make(map[string]minio.ObjectInfo)
@@ -148,6 +169,7 @@ func (sb *Backupper) backupBucket(buckets <-chan bucket) {
 				}
 			}
 			writeBucketJSON(bucketpath+"/bucket.json", newBucket)
+			klog.Infof("Processing bucket %s done\n", newBucket.Name)
 
 		default:
 			return
@@ -165,7 +187,7 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 		//			TLSHandshakeTimeout: 5 * time.Second,
 		//		},
 	})
-	sb.logErr(u.Name, "", err)
+	sb.logErr(u.Name, "", err, "New")
 
 	userpath := sb.backuppath + "/" + u.Endpoint + "/" + base64.StdEncoding.EncodeToString([]byte(u.Name))
 	if _, err := os.Stat(userpath); err != nil {
@@ -173,7 +195,7 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 	}
 
 	bl, err := mc.ListBuckets(context.Background())
-	sb.logErr(u.Name, "", err)
+	sb.logErr(u.Name, "", err, "ListBuckets")
 	if err != nil {
 		klog.Errorf("cannot list buckets of user %s", u.Name)
 		return
@@ -194,7 +216,7 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 	// loop over all backupped buckets
 	localbuckets, err := ioutil.ReadDir(userpath)
 	if err != nil {
-		sb.logErr(u.Name, "", err)
+		sb.logErr(u.Name, "", err, "ReadDir")
 		return
 	}
 	for _, bp := range localbuckets {
@@ -209,7 +231,7 @@ func (sb *Backupper) backupUser(u user, buckets chan bucket) {
 func (sb *Backupper) backup() {
 	userList, err := readUserFile(sb.filename)
 	if err != nil {
-		sb.logErr("", "", err)
+		sb.logErr("", "", err, "ReadUserFile")
 		return
 	}
 
@@ -225,7 +247,7 @@ func (sb *Backupper) backup() {
 			wgu.Done()
 		}(u)
 	}
-	time.Sleep(10 * time.Second)
+	time.Sleep(30 * time.Second)
 	wg.Add(sb.concurrency)
 	for i := 0; i < sb.concurrency; i++ {
 		go func() {
